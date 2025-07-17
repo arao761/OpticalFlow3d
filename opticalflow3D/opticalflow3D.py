@@ -1,6 +1,6 @@
 import typing
 
-import cupy as cp
+import torch
 import numpy as np
 from tqdm import tqdm
 
@@ -23,7 +23,7 @@ class Farneback3D:
         filter_type (str): Defines the type of filter used to average the calculated matrices. Defaults to "box"
         filter_size (int): Size of the filter used to average the matrices. Defaults to 21
         presmoothing (int): Standard deviation used to perform Gaussian smoothing of the images. Defaults to None
-        device_id (int): Device id of the GPU. Defaults to 0
+        device (str): Device to use for computation ('cuda' or 'cpu'). Defaults to 'cuda'
     """
 
     def __init__(self,
@@ -35,7 +35,7 @@ class Farneback3D:
                  filter_type: str = "box",
                  filter_size: int = 21,
                  presmoothing: int = None,
-                 device_id: int = 0,
+                 device: str = 'cuda',
                  ):
         self.iters = iters
         self.num_levels = num_levels
@@ -46,14 +46,13 @@ class Farneback3D:
         self.sigma_k = sigma_k
         self.filter_type = filter_type
         self.filter_size = filter_size
-        self.device_id = device_id
+        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
 
     def calculate_flow(self, image1: np.ndarray, image2: np.ndarray,
                        start_point: typing.Tuple[int, int, int] = (0, 0, 0),
                        total_vol: typing.Optional[typing.Tuple[int, int, int]] = None,
                        sub_volume: typing.Tuple[int, int, int] = (256, 256, 256),
                        overlap: typing.Tuple[int, int, int] = (64, 64, 64),
-                       threadsperblock: typing.Tuple[int, int, int] = (8, 8, 8),
                        ):
         """ Calculates the displacement across image1 and image2 using the 3D Farneback two frame algorithm
 
@@ -67,8 +66,6 @@ class Farneback3D:
                 Defaults to (256, 256, 256)
             overlap (typing.Tuple[int, int, int]): amount of overlap between adjacent subvolumes.
                 Defaults to (64, 64, 64)
-            threadsperblock (typing.Tuple[int, int, int]): Defines the number of cuda threads.
-                Defaults to (8, 8, 8)
 
         Returns:
             output_vz (np.ndarray): array containing the displacements in the x direction
@@ -89,9 +86,6 @@ class Farneback3D:
         output_vz = np.zeros(total_vol, dtype=np.float32)
         output_confidence = np.zeros(total_vol, dtype=np.float32)
 
-        mempool = cp.get_default_memory_pool()
-        pinned_mempool = cp.get_default_pinned_memory_pool()
-
         if np.any(total_vol > sub_volume):
 
             shape = image1.shape
@@ -110,21 +104,17 @@ class Farneback3D:
                                                    y_position[y_i][0]:y_position[y_i][1],
                                                    x_position[x_i][0]:x_position[x_i][1]].astype(np.float32)
 
-                        with cp.cuda.Device(self.device_id):
-                            vx, vy, vz, confidence = farneback_3d(input_image_vol_1, input_image_vol_2, self.iters,
-                                                                  self.num_levels,
-                                                                  scale=self.scale, spatial_size=self.spatial_size,
-                                                                  sigma_k=self.sigma_k, filter_type=self.filter_type,
-                                                                  filter_size=self.filter_size,
-                                                                  presmoothing=self.presmoothing,
-                                                                  threadsperblock=threadsperblock)
+                        vx, vy, vz, confidence = farneback_3d(input_image_vol_1, input_image_vol_2, self.iters,
+                                                              self.num_levels,
+                                                              scale=self.scale, spatial_size=self.spatial_size,
+                                                              sigma_k=self.sigma_k, filter_type=self.filter_type,
+                                                              filter_size=self.filter_size,
+                                                              presmoothing=self.presmoothing)
 
-                        cp.cuda.Stream.null.synchronize()
-
-                        vx_cpu = vx.get()
-                        vy_cpu = vy.get()
-                        vz_cpu = vz.get()
-                        confidence_cpu = confidence.get()
+                        vx_cpu = vx.cpu().numpy()
+                        vy_cpu = vy.cpu().numpy()
+                        vz_cpu = vz.cpu().numpy()
+                        confidence_cpu = confidence.cpu().numpy()
 
                         output_vx[z_valid_pos[z_i][0]: z_valid_pos[z_i][1],
                                   y_valid_pos[y_i][0]: y_valid_pos[y_i][1],
@@ -151,24 +141,22 @@ class Farneback3D:
                         del vx, vy, vz, confidence
                         del vx_cpu, vy_cpu, vz_cpu, confidence_cpu
 
-                        mempool.free_all_blocks()
-                        pinned_mempool.free_all_blocks()
+                        # Clear PyTorch cache
+                        if self.device.type == 'cuda':
+                            torch.cuda.empty_cache()
         else:
-            with cp.cuda.Device(self.device_id):
-                vx, vy, vz, confidence = farneback_3d(image1, image2,
-                                                      iters=self.iters,
-                                                      num_levels=self.num_levels,
-                                                      scale=self.scale, spatial_size=self.spatial_size,
-                                                      sigma_k=self.sigma_k,
-                                                      filter_type=self.filter_type, filter_size=self.filter_size,
-                                                      presmoothing=self.presmoothing,
-                                                      threadsperblock=threadsperblock)
-            cp.cuda.Stream.null.synchronize()
+            vx, vy, vz, confidence = farneback_3d(image1, image2,
+                                                  iters=self.iters,
+                                                  num_levels=self.num_levels,
+                                                  scale=self.scale, spatial_size=self.spatial_size,
+                                                  sigma_k=self.sigma_k,
+                                                  filter_type=self.filter_type, filter_size=self.filter_size,
+                                                  presmoothing=self.presmoothing)
 
-            output_vx = vx.get()
-            output_vy = vy.get()
-            output_vz = vz.get()
-            output_confidence = confidence.get()
+            output_vx = vx.cpu().numpy()
+            output_vy = vy.cpu().numpy()
+            output_vz = vz.cpu().numpy()
+            output_confidence = confidence.cpu().numpy()
 
         return output_vz, output_vy, output_vx, output_confidence
 
@@ -185,7 +173,7 @@ class PyrLK3D:
         filter_type (str): Defines the type of filter used to average the calculated matrices. Defaults to "gaussian"
         filter_size (int): Size of the filter used to average the matrices. Defaults to 21
         presmoothing (int): Standard deviation used to perform Gaussian smoothing of the images. Defaults to None
-        device_id (int): Device id of the GPU. Defaults to 0
+        device (str): Device to use for computation ('cuda' or 'cpu'). Defaults to 'cuda'
     """
 
     def __init__(self,
@@ -197,7 +185,7 @@ class PyrLK3D:
                  filter_type: str = "gaussian",
                  filter_size: int = 21,
                  presmoothing: int = None,
-                 device_id: int = 0,
+                 device: str = 'cuda',
                  ):
         self.iters = iters
         self.num_levels = num_levels
@@ -209,14 +197,13 @@ class PyrLK3D:
 
         self.filter_type = filter_type
         self.filter_size = filter_size
-        self.device_id = device_id
+        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
 
     def calculate_flow(self, image1: np.ndarray, image2: np.ndarray,
                        start_point: typing.Tuple[int, int, int] = (0, 0, 0),
                        total_vol: typing.Optional[typing.Tuple[int, int, int]] = None,
                        sub_volume: typing.Tuple[int, int, int] = (256, 256, 256),
                        overlap: typing.Tuple[int, int, int] = (64, 64, 64),
-                       threadsperblock: typing.Tuple[int, int, int] = (8, 8, 8),
                        ):
         """ Calculates the displacement across image1 and image2 using the 3D Pyramidal Lucas Kanade algorithm
 
@@ -230,8 +217,6 @@ class PyrLK3D:
                 Defaults to (256, 256, 256)
             overlap (typing.Tuple[int, int, int]): amount of overlap between adjacent subvolumes.
                 Defaults to (64, 64, 64)
-            threadsperblock (typing.Tuple[int, int, int]): Defines the number of cuda threads.
-                Defaults to (8, 8, 8)
 
         Returns:
             output_vz (np.ndarray): array containing the displacements in the x direction
@@ -250,9 +235,6 @@ class PyrLK3D:
         output_vy = np.zeros(total_vol, dtype=np.float32)
         output_vz = np.zeros(total_vol, dtype=np.float32)
 
-        mempool = cp.get_default_memory_pool()
-        pinned_mempool = cp.get_default_pinned_memory_pool()
-
         if np.any(total_vol > sub_volume):
             shape = image1.shape
             z_position, z_valid_pos, z_valid = get_positions(start_point, total_vol, sub_volume, shape, overlap, 0)
@@ -270,22 +252,18 @@ class PyrLK3D:
                                             y_position[y_i][0]:y_position[y_i][1],
                                             x_position[x_i][0]:x_position[x_i][1]].astype(np.float32)
 
-                        with cp.cuda.Device(self.device_id):
-                            vx, vy, vz = pyrlk_3d(input_image_vol_1, input_image_vol_2,
-                                                  iters=self.iters,
-                                                  num_levels=self.num_levels,
-                                                  scale=self.scale,
-                                                  tau=self.tau, alpha=self.alpha,
-                                                  filter_type=self.filter_type,
-                                                  filter_size=self.filter_size,
-                                                  presmoothing=self.presmoothing,
-                                                  threadsperblock=threadsperblock)
+                        vx, vy, vz = pyrlk_3d(input_image_vol_1, input_image_vol_2,
+                                              iters=self.iters,
+                                              num_levels=self.num_levels,
+                                              scale=self.scale,
+                                              tau=self.tau, alpha=self.alpha,
+                                              filter_type=self.filter_type,
+                                              filter_size=self.filter_size,
+                                              presmoothing=self.presmoothing)
 
-                        cp.cuda.Stream.null.synchronize()
-
-                        vx_cpu = vx.get()
-                        vy_cpu = vy.get()
-                        vz_cpu = vz.get()
+                        vx_cpu = vx.cpu().numpy()
+                        vy_cpu = vy.cpu().numpy()
+                        vz_cpu = vz.cpu().numpy()
 
                         output_vx[z_valid_pos[z_i][0]: z_valid_pos[z_i][1],
                         y_valid_pos[y_i][0]: y_valid_pos[y_i][1],
@@ -306,24 +284,21 @@ class PyrLK3D:
                         del vx, vy, vz
                         del vx_cpu, vy_cpu, vz_cpu
 
-                        mempool.free_all_blocks()
-                        pinned_mempool.free_all_blocks()
+                        # Clear PyTorch cache
+                        if self.device.type == 'cuda':
+                            torch.cuda.empty_cache()
         else:
-            with cp.cuda.Device(self.device_id):
-                vx, vy, vz = pyrlk_3d(image1, image2,
-                                      iters=self.iters,
-                                      num_levels=self.num_levels,
-                                      scale=self.scale,
-                                      tau=self.tau, alpha=self.alpha,
-                                      filter_type=self.filter_type,
-                                      filter_size=self.filter_size,
-                                      presmoothing=self.presmoothing,
-                                      threadsperblock=threadsperblock)
+            vx, vy, vz = pyrlk_3d(image1, image2,
+                                  iters=self.iters,
+                                  num_levels=self.num_levels,
+                                  scale=self.scale,
+                                  tau=self.tau, alpha=self.alpha,
+                                  filter_type=self.filter_type,
+                                  filter_size=self.filter_size,
+                                  presmoothing=self.presmoothing)
 
-            cp.cuda.Stream.null.synchronize()
-
-            output_vx = vx.get()
-            output_vy = vy.get()
-            output_vz = vz.get()
+            output_vx = vx.cpu().numpy()
+            output_vy = vy.cpu().numpy()
+            output_vz = vz.cpu().numpy()
 
         return output_vz, output_vy, output_vx

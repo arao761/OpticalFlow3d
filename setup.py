@@ -1,37 +1,23 @@
 from setuptools import setup, find_packages
 from os import path
-from pkg_resources import DistributionNotFound, get_distribution
 
 with open("README.md", "r") as file:
     long_description = file.read()
 
 _dir = path.dirname(__file__)
 
-
-def get_dist(pkgname):
-    try:
-        return get_distribution(pkgname)
-    except DistributionNotFound:
-        return None
-
-
 dependencies = [
     "numpy>=1.17.0",
-    "numba>=0.47.0",
     "scikit-image>=0.17.1",
     "scipy>=1.6.3",
-    "tqdm>=4.50.0"
+    "tqdm>=4.50.0",
+    "torch>=1.13.0"
 ]
-
-if get_dist('cupy-cuda102') is None and get_dist('cupy-cuda110') is None and get_dist('cupy-cuda111') is None and \
-        get_dist('cupy-cuda112') is None and get_dist('cupy-cuda113') is None and get_dist('cupy-cuda114') is None and \
-        get_dist('cupy-cuda115') is None and get_dist('cupy-cuda116') is None:
-    dependencies.append("cupy-cuda113>=10.0.0")
 
 setup(
     name='opticalflow3d',
     version="0.3.2",
-    description='GPU/CUDA optimized implementation of 3D optical flow algorithms such as Farneback two frame motion estimation and Lucas Kanade dense optical flow algorithms',
+    description='PyTorch optimized implementation of 3D optical flow algorithms such as Farneback two frame motion estimation and Lucas Kanade dense optical flow algorithms',
     long_description=long_description,
     long_description_content_type='text/markdown',
     install_requires=dependencies,

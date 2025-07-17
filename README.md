@@ -1,6 +1,6 @@
 # opticalflow3d
 
-GPU/CUDA optimized implementation of 3D optical flow algorithms such as Farneback two frame 
+PyTorch optimized implementation of 3D optical flow algorithms such as Farneback two frame 
 motion estimation and Lucas Kanade dense optical flow algorithms.
 
 Please see the [related projects](#related-projects) section for the other components of this pipeline
@@ -10,7 +10,7 @@ Please see the [related projects](#related-projects) section for the other compo
 Being able to efficiently calculate the displacements between two imaging volumes will allow us to query the 
 dynamics captured in the images. This would include 3D biological samples and 3D force micrsocopy. However, a CPU 
 based implementation would be too time consuming. Thus, this repository was created to address this problem by 
-providing GPU accelerated implementation of various optical flow algorithms. Speed is key here, and tricks such as 
+providing PyTorch GPU accelerated implementation of various optical flow algorithms. Speed is key here, and tricks such as 
 separable convolutions are used.
 
 Currently, two optical flow methods are implemented:
@@ -43,10 +43,9 @@ parameters as well.
 ### Required packages
 The following packages are required. Please ensure that they are installed using either pip or conda.
 - numpy
-- numba
 - scikit-image
 - scipy
-- cupy
+- torch
 - tqdm
 
 ### Installation
@@ -55,12 +54,7 @@ This package is available via pip and can be installed using:
 pip install opticalflow3d
 ```
 
-Please also ensure that a compatible cudatoolkit version is installed alongside the cupy package. As the default 
-cupy package (cupy-cuda113) relies on cudatoolkit v11.3.1, this needs to be installed as well using conda:
-
-```
-conda install -c conda-forge cudatoolkit==11.3.1
-```
+Please ensure that a compatible PyTorch version is installed. Visit [PyTorch installation guide](https://pytorch.org/get-started/locally/) for detailed instructions on how to install PyTorch with the appropriate CUDA support for your system.
 
 ### Examples
 Examples can be found in the examples folder

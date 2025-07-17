@@ -5,10 +5,8 @@ import numpy.typing as npt
 import skimage.io
 import numpy as np
 import math
-import cupy as cp
-from cupyx.scipy import ndimage
-import cupyx
-from numba import njit, prange
+import torch
+import torch.nn.functional as F
 import scipy.ndimage
 
 
@@ -32,53 +30,96 @@ def gaussian_kernel_1d(sigma: float, radius: int = None) -> npt.ArrayLike:
     return output_kernel
 
 
-def gaussian_pyramid_3d(image, sigma: float = 1, scale: float = 0.5) -> typing.Tuple[np.ndarray, npt.ArrayLike]:
+def gaussian_pyramid_3d(image, sigma: float = 1, scale: float = 0.5) -> typing.Tuple[torch.Tensor, npt.ArrayLike]:
     """ Downscales the image for use in a Gaussian pyramid
 
     Args:
-        image (cuda array): Image to generate pyramids from
+        image (torch.Tensor): Image to generate pyramids from
         sigma (float): Standard deviation of the Gaussian kernel used for downscaling. Defaults to 1
         scale (float): Scale factor used to downscale the image. Defaults to 0.5.
 
     Returns:
-        resized_image (ndarray): Downscaled image
+        resized_image (torch.Tensor): Downscaled image
         true_scale (typing.Tuple[float, float, float]): Actual scaling factor used. This differs slightly from the input
             scaling factor in cases when the factor used causes the size of the image to not be an integer.
     """
-    kernel = cp.asarray(gaussian_kernel_1d(sigma), dtype=cp.float32)
+    # Convert image to torch tensor if it's not already
+    if not isinstance(image, torch.Tensor):
+        image = torch.tensor(image, dtype=torch.float32)
+    
+    # Ensure image is on the same device as original
+    device = image.device
+    
+    kernel = torch.tensor(gaussian_kernel_1d(sigma), dtype=torch.float32, device=device)
     radius = math.ceil(2 * sigma)
 
-    # gaussian smoothing
-    image = cupyx.scipy.ndimage.convolve(image, cp.reshape(kernel, (2 * radius + 1, 1, 1)), mode="reflect")
-    image = cupyx.scipy.ndimage.convolve(image, cp.reshape(kernel, (1, 2 * radius + 1, 1)), mode="reflect")
-    image = cupyx.scipy.ndimage.convolve(image, cp.reshape(kernel, (1, 1, 2 * radius + 1)), mode="reflect")
+    # gaussian smoothing using separable 1D convolutions
+    # PyTorch convolution expects (batch, channels, D, H, W) format
+    image_5d = image.unsqueeze(0).unsqueeze(0)  # Add batch and channel dims
+    
+    # Create 3D kernels for each direction
+    kernel_z = kernel.view(1, 1, 2 * radius + 1, 1, 1)
+    kernel_y = kernel.view(1, 1, 1, 2 * radius + 1, 1)
+    kernel_x = kernel.view(1, 1, 1, 1, 2 * radius + 1)
+    
+    # Apply separable convolutions
+    image_5d = F.conv3d(image_5d, kernel_z, padding=(radius, 0, 0))
+    image_5d = F.conv3d(image_5d, kernel_y, padding=(0, radius, 0))
+    image_5d = F.conv3d(image_5d, kernel_x, padding=(0, 0, radius))
+    
+    # Remove batch and channel dimensions
+    image = image_5d.squeeze(0).squeeze(0)
 
     shape = image.shape
     true_scale = [int(round(shape[0] * scale)) / shape[0],
                   int(round(shape[1] * scale)) / shape[1],
                   int(round(shape[2] * scale)) / shape[2]]
-    resized_image = cp.empty((int(round(shape[0] * scale)),
-                              int(round(shape[1] * scale)),
-                              int(round(shape[2] * scale))), dtype=cp.float32)
-    ndimage.zoom(image, (scale, scale, scale), output=resized_image, mode="reflect")
+    
+    # Use interpolate for resizing
+    new_shape = (int(round(shape[0] * scale)),
+                 int(round(shape[1] * scale)),
+                 int(round(shape[2] * scale)))
+    
+    resized_image = F.interpolate(
+        image.unsqueeze(0).unsqueeze(0),  # Add batch and channel dims
+        size=new_shape,
+        mode='trilinear',
+        align_corners=False
+    ).squeeze(0).squeeze(0)  # Remove batch and channel dims
 
     return resized_image, true_scale
 
 
-def imresize_3d(image, scale: typing.Tuple[float, float, float] = (0.5, 0.5, 0.5)) -> np.ndarray:
+def imresize_3d(image, scale: typing.Tuple[float, float, float] = (0.5, 0.5, 0.5)) -> torch.Tensor:
     """ Upscales the image by the specified factor
 
     Args:
-        image (cuda array): image to generate pyramids from
+        image (torch.Tensor): image to generate pyramids from
         scale (typing.Tuple[float, float, float]): Scale factor used to downscale the image. Actual factor used is 1/scale.
             Defaults to (0.5, 0.5, 0.5).
 
     Returns:
-        image (ndarray): Upscaled image
+        image (torch.Tensor): Upscaled image
     """
-    image = ndimage.zoom(image, (1 / scale[0], 1 / scale[1], 1 / scale[2]))
+    # Convert to tensor if needed
+    if not isinstance(image, torch.Tensor):
+        image = torch.tensor(image, dtype=torch.float32)
+    
+    # Calculate new size
+    current_shape = image.shape
+    new_shape = (int(current_shape[0] / scale[0]),
+                 int(current_shape[1] / scale[1]),
+                 int(current_shape[2] / scale[2]))
+    
+    # Use interpolate for resizing
+    resized_image = F.interpolate(
+        image.unsqueeze(0).unsqueeze(0),  # Add batch and channel dims
+        size=new_shape,
+        mode='trilinear',
+        align_corners=False
+    ).squeeze(0).squeeze(0)  # Remove batch and channel dims
 
-    return image
+    return resized_image
 
 
 def get_positions(start_point: typing.Tuple[int, int, int],
@@ -247,11 +288,36 @@ def generate_inverse_image(image, vx, vy, vz, use_gpu: bool = True) -> np.ndarra
     map_y_inverse = map_y_inverse / (distance_total + 1e-12)
     map_z_inverse = map_z_inverse / (distance_total + 1e-12)
 
-    if use_gpu:
-        inverse_image_gpu = cupyx.scipy.ndimage.map_coordinates(cp.asarray(image),
-                                                                cp.array([map_z_inverse, map_y_inverse, map_x_inverse]),
-                                                                mode="mirror")
-        inverse_image = inverse_image_gpu.get()
+    if use_gpu and torch.cuda.is_available():
+        # Convert to torch tensors on GPU
+        image_tensor = torch.tensor(image, dtype=torch.float32, device='cuda')
+        coords = torch.stack([
+            torch.tensor(map_z_inverse, dtype=torch.float32, device='cuda'),
+            torch.tensor(map_y_inverse, dtype=torch.float32, device='cuda'),
+            torch.tensor(map_x_inverse, dtype=torch.float32, device='cuda')
+        ])
+        
+        # Normalize coordinates to [-1, 1] for grid_sample
+        D, H, W = image.shape
+        coords_norm = torch.stack([
+            2.0 * coords[2] / (W - 1) - 1.0,  # x
+            2.0 * coords[1] / (H - 1) - 1.0,  # y  
+            2.0 * coords[0] / (D - 1) - 1.0   # z
+        ], dim=-1)
+        
+        # Reshape for grid_sample: (N, D, H, W, 3)
+        coords_norm = coords_norm.permute(1, 2, 3, 0).unsqueeze(0)
+        
+        # Apply grid sampling
+        inverse_image_tensor = F.grid_sample(
+            image_tensor.unsqueeze(0).unsqueeze(0),  # Add batch and channel dims
+            coords_norm,
+            mode='bilinear',
+            padding_mode='reflection',
+            align_corners=True
+        )
+        
+        inverse_image = inverse_image_tensor.squeeze(0).squeeze(0).cpu().numpy()
     else:
         inverse_image = scipy.ndimage.map_coordinates(image,
                                                       np.array([map_z_inverse, map_y_inverse, map_x_inverse]),
@@ -260,20 +326,28 @@ def generate_inverse_image(image, vx, vy, vz, use_gpu: bool = True) -> np.ndarra
     return inverse_image
 
 
-@njit(parallel=True)
 def inverse(xmap, ymap, zmap, xmin=0, ymin=0, zmin=0, dist_threshold=1, eps=1e-12):
+    """ Compute inverse mapping using PyTorch if available, otherwise numpy """
     shape = xmap.shape
     inverse_x = np.zeros_like(xmap)
     inverse_y = np.zeros_like(xmap)
     inverse_z = np.zeros_like(xmap)
     distance_total = np.zeros_like(xmap)
 
-    for i in prange(shape[0]):
+    # Use PyTorch if available and arrays are reasonable size
+    if torch.cuda.is_available() and np.prod(shape) < 1e8:  # Avoid GPU for very large arrays
+        try:
+            return _inverse_torch(xmap, ymap, zmap, xmin, ymin, zmin, dist_threshold, eps)
+        except:
+            pass  # Fall back to numpy implementation
+    
+    # Numpy implementation
+    for i in range(shape[0]):
         for j in range(shape[1]):
             for k in range(shape[2]):
-                idz = np.int32(np.round(i + zmap[i, j, k]))
-                idy = np.int32(np.round(j + ymap[i, j, k]))
-                idx = np.int32(np.round(k + xmap[i, j, k]))
+                idz = int(round(i + zmap[i, j, k]))
+                idy = int(round(j + ymap[i, j, k]))
+                idx = int(round(k + xmap[i, j, k]))
 
                 for zval in range(max(idz - dist_threshold, zmin), min(idz + dist_threshold, zmin + shape[0])):
                     for yval in range(max(idy - dist_threshold, ymin), min(idy + dist_threshold, ymin + shape[1])):
@@ -289,3 +363,58 @@ def inverse(xmap, ymap, zmap, xmin=0, ymin=0, zmin=0, dist_threshold=1, eps=1e-1
                             distance_total[zval, yval, xval] += inverse_distance
 
     return inverse_x, inverse_y, inverse_z, distance_total
+
+
+def _inverse_torch(xmap, ymap, zmap, xmin=0, ymin=0, zmin=0, dist_threshold=1, eps=1e-12):
+    """ PyTorch implementation of inverse mapping """
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    # Convert to tensors
+    xmap_t = torch.tensor(xmap, dtype=torch.float32, device=device)
+    ymap_t = torch.tensor(ymap, dtype=torch.float32, device=device)
+    zmap_t = torch.tensor(zmap, dtype=torch.float32, device=device)
+    
+    shape = xmap_t.shape
+    inverse_x = torch.zeros_like(xmap_t)
+    inverse_y = torch.zeros_like(ymap_t)
+    inverse_z = torch.zeros_like(zmap_t)
+    distance_total = torch.zeros_like(xmap_t)
+    
+    # Create coordinate grids
+    i_coords, j_coords, k_coords = torch.meshgrid(
+        torch.arange(shape[0], device=device),
+        torch.arange(shape[1], device=device),
+        torch.arange(shape[2], device=device),
+        indexing='ij'
+    )
+    
+    # Compute target coordinates
+    target_z = (i_coords + zmap_t).round().long()
+    target_y = (j_coords + ymap_t).round().long()
+    target_x = (k_coords + xmap_t).round().long()
+    
+    # Process in batches to avoid memory issues
+    batch_size = 1000
+    for start_idx in range(0, shape[0], batch_size):
+        end_idx = min(start_idx + batch_size, shape[0])
+        
+        for i in range(start_idx, end_idx):
+            for j in range(shape[1]):
+                for k in range(shape[2]):
+                    idz = target_z[i, j, k].item()
+                    idy = target_y[i, j, k].item()
+                    idx = target_x[i, j, k].item()
+                    
+                    for zval in range(max(idz - dist_threshold, zmin), min(idz + dist_threshold, zmin + shape[0])):
+                        for yval in range(max(idy - dist_threshold, ymin), min(idy + dist_threshold, ymin + shape[1])):
+                            for xval in range(max(idx - dist_threshold, xmin), min(idx + dist_threshold, xmin + shape[2])):
+                                distance = (zval - (i + zmap_t[i, j, k])) ** 2 + (yval - (j + ymap_t[i, j, k])) ** 2 + (
+                                            xval - (k + xmap_t[i, j, k])) ** 2
+                                inverse_distance = 1 / (distance + eps)
+                                
+                                inverse_z[zval, yval, xval] += inverse_distance * i
+                                inverse_y[zval, yval, xval] += inverse_distance * j
+                                inverse_x[zval, yval, xval] += inverse_distance * k
+                                distance_total[zval, yval, xval] += inverse_distance
+    
+    return inverse_x.cpu().numpy(), inverse_y.cpu().numpy(), inverse_z.cpu().numpy(), distance_total.cpu().numpy()
